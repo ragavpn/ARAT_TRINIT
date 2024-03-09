@@ -1,0 +1,6 @@
+model_name: bert-base-uncased
+learning_rate: 0.001
+batch_size: 16
+num_epochs: 20
+max_samples: 1600
+max_length: 64

@@ -1,0 +1,4 @@
+clip_checkpoint.pt
+train_dataset.pkl
+valid_dataset.pkl
+test_dataset.pkl
