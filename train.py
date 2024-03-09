@@ -93,33 +93,37 @@ class CustomDataset(Dataset):
             'attention_mask': torch.tensor(attention_mask, dtype=torch.long)
         }
 
-class CLIPModel(nn.Module):
-    def __init__(self, image_encoder, text_encoder, common_dim=500):
-        super(CLIPModel, self).__init__()
+class CaptionModel(nn.Module):
+    def __init__(self, image_encoder, text_encoder, vocab_size = 30522, common_dim=500, hidden_dim=256):
+        super(CaptionModel, self).__init__()
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
         self.image_projection = nn.Linear(image_encoder.fc.out_features, common_dim)
         self.text_projection = nn.Linear(text_encoder.config.hidden_size, common_dim)
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.decoder = nn.LSTM(common_dim, hidden_dim, batch_first=True)
+        self.fc_out = nn.Linear(hidden_dim, vocab_size)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, images, captions):
         image_features = self.image_encoder(images)
-        text_features = self.text_encoder(**captions).last_hidden_state.mean(dim=1)
-
-        # Project the features to a common dimension
         image_features = self.image_projection(image_features)
-        text_features = self.text_projection(text_features)
 
-        # Normalize the features
+        # Normalize the image features
         image_features = F.normalize(image_features, dim=-1)
-        text_features = F.normalize(text_features, dim=-1)
 
-        # Compute cosine similarity scores
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logit_scale * text_features @ image_features.t()
+        # Reshape image features to (batch_size, 1, common_dim) for LSTM
+        image_features = image_features.unsqueeze(1)
 
-        return logits_per_image, logits_per_text
+        # Pass the image features and captions through the LSTM decoder
+        decoder_outputs, _ = self.decoder(torch.cat([image_features, captions], dim=1))
+
+        # Pass the decoder outputs through the dropout layer
+        decoder_outputs = self.dropout(decoder_outputs)
+
+        # Pass the decoder outputs through the fully connected layer to get the final output
+        output = self.fc_out(decoder_outputs)
+
+        return output
 
 
 def contrastive_loss(similarity_matrix, labels, margin=0.2):
@@ -173,7 +177,7 @@ valid_dataset_path = "./valid.csv"
 
 # Define hyperparameters and other configurations
 model_name = "bert-base-uncased"
-checkpoint_path = "clip_checkpoint.pt"
+checkpoint_path = "Caption_checkpoint.pt"
 learning_rate = 0.001
 batch_size = 16
 num_epochs = 20
@@ -205,8 +209,8 @@ if hyperparameters != saved_hyperparameters:
         os.remove("valid_dataset.pkl")
     if os.path.exists("test_dataset.pkl"):
         os.remove("test_dataset.pkl")
-    if os.path.exists("clip_checkpoint.pt"):
-        os.remove("clip_checkpoint.pt")
+    if os.path.exists("Caption_checkpoint.pt"):
+        os.remove("Caption_checkpoint.pt")
 
 # Encoders for the model
 resnet = models.resnet50(pretrained=True)
@@ -227,16 +231,16 @@ train_loader = DataLoader(train_dataset.samples, batch_size=batch_size, shuffle=
 valid_loader = DataLoader(valid_dataset.samples, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset.samples, batch_size=batch_size, shuffle=True)
 
-# Create CLIP model instance
-clip_model = CLIPModel(resnet, bert)
+# Create Caption model instance
+caption_model = CaptionModel(resnet, bert)
 
 # Define optimizer and loss function
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(clip_model.parameters(), lr=learning_rate)
+optimizer = optim.Adam(caption_model.parameters(), lr=learning_rate)
 
 # Training loop
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-clip_model.to(device)
+caption_model.to(device)
 
 # Initialize lists to store train and validation losses
 train_losses = []
@@ -245,7 +249,7 @@ val_losses = []
 for epoch in range(num_epochs):
 
     print(f"Epoch [{epoch + 1}/{num_epochs}]")
-    clip_model.train()
+    caption_model.train()
     total_loss = 0.0
 
     for batch_images, batch_captions in train_loader:
@@ -257,15 +261,10 @@ for epoch in range(num_epochs):
 
             # Forward pass
             optimizer.zero_grad()
-            logits_per_image, logits_per_text = clip_model(batch_images, batch_captions)
-
-            # Combine logits for images and texts
-            combined_logits = logits_per_image + logits_per_text
-
-            batch_labels = torch.eye(batch_size).to(device)
+            outputs = caption_model(batch_images, batch_captions)
 
             # Calculate the loss using CrossEntropyLoss
-            loss = contrastive_loss(combined_logits, batch_labels)
+            loss = criterion(outputs.view(-1, outputs.size(2)), batch_captions.view(-1))
 
             # Backpropagation and optimization
             loss.backward()
@@ -274,10 +273,9 @@ for epoch in range(num_epochs):
             total_loss += loss.item()
         except KeyboardInterrupt:
             print("Force Checkpoint")
-            save_model(clip_model, optimizer, epoch, checkpoint_path)
+            save_model(caption_model, optimizer, epoch, checkpoint_path)
         
-    save_model(clip_model, optimizer, epoch, checkpoint_path)
-    print("Model Saved")
+    save_model(caption_model, optimizer, epoch, checkpoint_path)
 
     # Calculate average loss for the epoch
     average_loss = total_loss / len(train_loader)
@@ -287,7 +285,7 @@ for epoch in range(num_epochs):
     train_losses.append(average_loss)
 
     # Validation loop
-    clip_model.eval()  # Set the model to evaluation mode (disable dropout, batch normalization, etc.)
+    caption_model.eval()  # Set the model to evaluation mode (disable dropout, batch normalization, etc.)
     total_loss = 0.0
 
     with torch.no_grad():
@@ -299,16 +297,10 @@ for epoch in range(num_epochs):
             }
 
             # Forward pass
-            optimizer.zero_grad()
-            logits_per_image, logits_per_text = clip_model(batch_images, batch_captions)
-
-            # Combine logits for images and texts
-            combined_logits = logits_per_image + logits_per_text
-
-            batch_labels = torch.eye(batch_size).to(device)
+            outputs = caption_model(batch_images, batch_captions)
 
             # Calculate the loss using CrossEntropyLoss
-            loss = contrastive_loss(combined_logits, batch_labels)
+            loss = criterion(outputs.view(-1, outputs.size(2)), batch_captions.view(-1))
             total_loss += loss.item()
 
     # Calculate average loss for the validation set
@@ -319,7 +311,7 @@ for epoch in range(num_epochs):
     val_losses.append(average_loss)
 
 #Test the model
-clip_model.eval()  # Set the model to evaluation mode (disable dropout, batch normalization, etc.)
+caption_model.eval()  # Set the model to evaluation mode (disable dropout, batch normalization, etc.)
 total_loss = 0.0
 
 with torch.no_grad():
@@ -332,7 +324,7 @@ with torch.no_grad():
 
         # Forward pass
         optimizer.zero_grad()
-        logits_per_image, logits_per_text = clip_model(batch_images, batch_captions)
+        logits_per_image, logits_per_text = caption_model(batch_images, batch_captions)
 
         # Combine logits for images and texts
         combined_logits = logits_per_image + logits_per_text

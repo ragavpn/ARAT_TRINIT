@@ -1,6 +1,6 @@
-model_name: bert-base-uncased
+model_name: nlpconnect/vit-gpt2-image-captioning
 learning_rate: 0.001
 batch_size: 16
-num_epochs: 20
-max_samples: 1600
-max_length: 64
+num_epochs: 10
+max_samples: 3000
+max_length: 32
